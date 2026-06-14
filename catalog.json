@@ -1,0 +1,46 @@
+{
+  "categories": [
+    {
+      "id": "ranks",
+      "name": "Ranks",
+      "emoji": "👑",
+      "description": "Permanent Lunaris Craft ranks"
+    },
+    {
+      "id": "keys",
+      "name": "Keys",
+      "emoji": "🗝️",
+      "description": "Crate keys delivered automatically"
+    }
+  ],
+  "products": [
+    {
+      "id": "vip-rank",
+      "categoryId": "ranks",
+      "name": "VIP Rank",
+      "description": "Permanent VIP rank.",
+      "priceCentavos": 19900,
+      "enabled": true,
+      "deliveries": [
+        {
+          "type": "minecraft_command",
+          "command": "lp user {minecraft} parent add vip"
+        }
+      ]
+    },
+    {
+      "id": "premium-keys",
+      "categoryId": "keys",
+      "name": "5 Premium Keys",
+      "description": "Five premium crate keys.",
+      "priceCentavos": 9900,
+      "enabled": true,
+      "deliveries": [
+        {
+          "type": "minecraft_command",
+          "command": "crate key give {minecraft} premium 5"
+        }
+      ]
+    }
+  ]
+}

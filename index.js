@@ -6,6 +6,7 @@ import {
   Partials
 } from "discord.js";
 import {
+  handleBridgeDmMessage,
   handleBridgeCommand,
   handleBridgeInteraction,
   startBridgeService
@@ -37,7 +38,13 @@ client.once(Events.ClientReady, readyClient => {
 });
 
 client.on(Events.MessageCreate, async message => {
-  if (message.author.bot || !message.guild) return;
+  if (message.author.bot) return;
+  if (!message.guild) {
+    await handleBridgeDmMessage(message).catch(error => {
+      console.error("DM bridge error:", error);
+    });
+    return;
+  }
   if (!message.content.startsWith(PREFIX)) return;
 
   const args = message.content

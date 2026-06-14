@@ -1,0 +1,19 @@
+{
+  "name": "devy-network-lunaris-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Lunaris Bridge Discord wallet and Minecraft store.",
+  "main": "index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js && node --check bridge.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.21.0",
+    "rcon-client": "^4.2.5"
+  }
+}

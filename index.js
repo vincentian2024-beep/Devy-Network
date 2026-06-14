@@ -15,6 +15,7 @@ import {
 
 const token = process.env.DISCORD_TOKEN;
 const clientId = process.env.DISCORD_CLIENT_ID;
+const PREFIX = "?";
 
 if (!token) {
   console.error("Missing DISCORD_TOKEN. Add it in Railway Variables.");

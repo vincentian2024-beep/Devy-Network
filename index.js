@@ -1,7 +1,9 @@
 import {
   Client,
+  EmbedBuilder,
   Events,
-  GatewayIntentBits
+  GatewayIntentBits,
+  Partials
 } from "discord.js";
 import {
   handleBridgeCommand,
@@ -21,8 +23,10 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages
+  ],
+  partials: [Partials.Channel]
 });
 
 startBridgeService(client);
@@ -47,18 +51,47 @@ client.on(Events.MessageCreate, async message => {
   try {
     const handled = await handleBridgeCommand(message, command, args);
     if (!handled && command === "help") {
-      await message.reply([
-        "**Lunaris Bridge Commands**",
-        "`?wallet` - Check your wallet",
-        "`?store` - Browse the store",
-        "`?link MinecraftName` - Link Minecraft",
-        "",
-        "**Staff**",
-        "`?bridgepanel topup` - Post top-up panel",
-        "`?bridgepanel store` - Post store panel",
-        "`?approve LB-REFERENCE RECEIPT-ID` - Approve payment",
-        "`?credit @member 500 reason` - Credit a wallet"
-      ].join("\n"));
+      await message.reply({
+        embeds: [new EmbedBuilder()
+          .setColor(Number.parseInt(process.env.BRIDGE_COLOR || "7C3AED", 16))
+          .setAuthor({ name: "Lunaris Craft • Lunaris Bridge" })
+          .setTitle("Command Center")
+          .setDescription("Official wallet, store, and automated delivery commands.")
+          .addFields(
+            {
+              name: "Customer Commands",
+              value: [
+                "`?wallet` — View your private wallet",
+                "`?store` — Open the private store",
+                "`?link MinecraftName` — Link delivery account"
+              ].join("\n")
+            },
+            {
+              name: "Staff Panels",
+              value: [
+                "`?bridgepanel topup` — Post wallet panel",
+                "`?bridgepanel store` — Post store panel"
+              ].join("\n")
+            },
+            {
+              name: "Product Management",
+              value: [
+                "`?addproduct (name) (description) (Rank or Keys) (price)`",
+                "`?removeproduct (name or ID)`",
+                "`?products` — List configured products"
+              ].join("\n")
+            },
+            {
+              name: "Wallet Administration",
+              value: [
+                "`?approve LB-REFERENCE RECEIPT-ID` — Emergency approval",
+                "`?credit @member 500 reason` — Manual credit"
+              ].join("\n")
+            }
+          )
+          .setFooter({ text: "Powered by Devy Network" })
+          .setTimestamp()]
+      });
     }
   } catch (error) {
     console.error("Command error:", error);

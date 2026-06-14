@@ -1,12 +1,6 @@
 {
-  "name": "devy-network",
-  "version": "1.0.0",
-  "main": "src/index.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node src/index.js"
-  },
-  "dependencies": {
-    "discord.js": "^14.21.0",
-    "dotenv": "^17.0.0"
+    "start": "node index.js"
   }
 }

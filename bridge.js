@@ -125,9 +125,9 @@ function migrateData() {
   if (!data.deliveryQueue) { data.deliveryQueue = []; changed = true; }
   if (changed) saveData(data);
 }
-migrateData();
 
 ensureDataFile();
+migrateData();
 
 function ensureCatalogFile() {
   if (fs.existsSync(CATALOG_FILE)) return;

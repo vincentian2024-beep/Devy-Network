@@ -1645,15 +1645,14 @@ export async function handleBridgeInteraction(interaction) {
           { name: "Exact Amount", value: `**${php(amount)}**`, inline: true },
           {
             name: "Send To",
-            value: `\`${process.env.GCASH_RECEIVER_NUMBER || "Not configured"}\``,
+            value: `\`09760064435\``,
             inline: true
           },
           { name: "Your Sender Number", value: `\`${phone}\``, inline: true },
           { name: "Payment Reference", value: `\`${reference}\`` },
           {
             name: "Next Step",
-            value: process.env.PAYMENT_INSTRUCTIONS ||
-              `Send the exact amount, then DM this bot your screenshot. Include reference ${reference} if you have multiple top-ups.`
+            value: `Send the exact amount to GCash receiver 09760064435, then DM this bot your screenshot receipt. Include reference ${reference} if you have multiple top-ups.`
           }
         )],
         ephemeral: true

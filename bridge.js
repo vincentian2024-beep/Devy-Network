@@ -70,6 +70,36 @@ function invalidateStoreSettingsCache() {
   cache.storeSettingsTime = 0;
 }
 
+// Rate limiting to prevent spam
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW = 3000; // 3 seconds per action per user
+const RATE_LIMIT_MAX = 5; // 5 actions per window
+
+function checkRateLimit(userId, action) {
+  const key = `${userId}:${action}`;
+  const now = Date.now();
+  if (!rateLimitMap.has(key)) {
+    rateLimitMap.set(key, { count: 0, reset: now + RATE_LIMIT_WINDOW });
+  }
+  const limit = rateLimitMap.get(key);
+  if (now > limit.reset) {
+    limit.count = 0;
+    limit.reset = now + RATE_LIMIT_WINDOW;
+  }
+  limit.count++;
+  return limit.count <= RATE_LIMIT_MAX;
+}
+
+// Cleanup rate limits periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of rateLimitMap) {
+    if (now > value.reset) {
+      rateLimitMap.delete(key);
+    }
+  }
+}, 60000);
+
 function ensureDataFile() {
   if (fs.existsSync(DATA_FILE)) return;
   fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
@@ -734,12 +764,20 @@ async function processDeliveryQueue(client) {
     const product = catalog.products.find(p => p.id === order.productId);
     if (!product) {
       await runTransaction(d => { d.deliveryQueue = (d.deliveryQueue || []).filter(x => x !== orderId); d.orders[orderId].status = "failed"; d.orders[orderId].error = "Product missing"; });
-      await audit(client, `Delivery failed (product missing): \`${orderId}\``);
+      await audit(client, `Delivery failed (product missing): \`${orderId}\` - Product not found in catalog`);
       continue;
     }
     try {
       const online = await isPlayerOnline(order.minecraftName).catch(() => false);
-      if (!online) continue;
+      if (!online) {
+        // Track retry attempts
+        const retryCount = (order.deliveryRetries || 0);
+        if (retryCount >= 50) { // After 50 retries (50+ hours), give up
+          await runTransaction(d => { d.orders[orderId].status = "manual_review"; d.orders[orderId].error = "Player offline too long"; d.deliveryQueue = (d.deliveryQueue || []).filter(x => x !== orderId); });
+          await audit(client, `Delivery abandoned: \`${orderId}\` - Player \`${order.minecraftName}\` offline for 50+ retries`);
+        }
+        continue;
+      }
       // attempt deliveries
       for (const delivery of product.deliveries) {
         if (delivery.type === "minecraft_command") {
@@ -754,10 +792,11 @@ async function processDeliveryQueue(client) {
       }
       await runTransaction(d => { d.orders[orderId].status = "completed"; d.orders[orderId].completedAt = new Date().toISOString(); d.deliveryQueue = (d.deliveryQueue || []).filter(x => x !== orderId); });
       await sendCustomerAndStaffReceipts(client, order, product, "delivered");
-      await audit(client, `Queued order delivered: \`${orderId}\``);
+      await audit(client, `Queued order delivered: \`${orderId}\` to player \`${order.minecraftName}\``);
     } catch (e) {
-      await runTransaction(d => { d.orders[orderId].status = "manual_review"; d.orders[orderId].error = e.message; });
-      await audit(client, `Queued delivery failed: \`${orderId}\` ${e.message}`);
+      const retryCount = (order.deliveryRetries || 0) + 1;
+      await runTransaction(d => { d.orders[orderId].deliveryRetries = retryCount; d.orders[orderId].lastDeliveryError = e.message; });
+      await audit(client, `Queued delivery failed (attempt ${retryCount}): \`${orderId}\` error: ${e.message}`);
     }
   }
 }
@@ -825,7 +864,7 @@ export async function handleBridgeCommand(message, command, args) {
   if (![
     "bridgepanel", "linkpanel", "paneledit", "testexpire", "wallet", "store", "link",
     "profile", "orders", "payments", "help", "approve", "credit", "order",
-    "addproduct", "removeproduct", "products", "storemode", "editproduct", "refund"
+    "addproduct", "removeproduct", "products", "storemode", "editproduct", "refund", "stats"
   ].includes(command)) {
     return false;
   }
@@ -934,9 +973,13 @@ export async function handleBridgeCommand(message, command, args) {
             "`?addproduct (name) (description) (Rank or Keys) (price)`",
             "`?removeproduct (name or ID)`",
             "`?products` — List configured products",
-            "`?approve LB-REFERENCE RECEIPT-ID` — Approve top-up",
+            "`?editproduct <id> <field> <value>` — Update product details",
+            "`?approve LB-REFERENCE` — Approve top-up",
             "`?credit @member 500 reason` — Manually credit wallet",
+            "`?refund LBO-ID [reason]` — Refund completed order",
             "`?order LBO-ID` — Show order details",
+            "`?stats` — View analytics dashboard",
+            "`?storemode <open|maintenance|closed>` — Control store access",
             "`?testexpire` — Run expiry notification test"
           ].join("\n")
         });
@@ -1140,6 +1183,48 @@ Bedrock names must start with a dot, for example .Steve123.`
       return true;
     }
 
+    if (command === "stats") {
+      const data = loadJson(DATA_FILE);
+      const catalog = loadJson(CATALOG_FILE);
+      const orders = Object.values(data.orders || {});
+      const ledger = data.ledger || [];
+      
+      const completed = orders.filter(o => o.status === "completed").length;
+      const queued = orders.filter(o => o.status === "queued").length;
+      const failed = orders.filter(o => o.status === "failed").length;
+      const refunded = orders.filter(o => o.status === "refunded").length;
+      const totalRevenue = orders
+        .filter(o => o.status === "completed" || o.status === "refunded")
+        .reduce((sum, o) => sum + o.amountCentavos, 0);
+      
+      const topProducts = catalog.products
+        .map(p => ({
+          name: p.name,
+          sales: orders.filter(o => o.productId === p.id && o.status === "completed").length,
+          revenue: orders
+            .filter(o => o.productId === p.id && o.status === "completed")
+            .reduce((sum, o) => sum + o.amountCentavos, 0)
+        }))
+        .sort((a, b) => b.sales - a.sales)
+        .slice(0, 5);
+      
+      const uniqueUsers = new Set(orders.map(o => o.userId)).size;
+      const totalTransactions = ledger.length;
+      
+      await message.reply({
+        embeds: [animatedEmbed("Store Analytics Dashboard", "Comprehensive store metrics and statistics")
+          .addFields(
+            { name: "📊 Orders", value: `Completed: **${completed}**\nQueued: **${queued}**\nFailed: **${failed}**\nRefunded: **${refunded}**`, inline: true },
+            { name: "💰 Revenue", value: `Total: **${php(totalRevenue)}**\nAvg/Order: **${php(completed > 0 ? totalRevenue / completed : 0)}**`, inline: true },
+            { name: "👥 Users & Activity", value: `Unique Buyers: **${uniqueUsers}**\nTotal Ledger Entries: **${totalTransactions}**`, inline: true },
+            { name: "🏆 Top 5 Products", value: topProducts.map(p => `**${p.name}** (${p.sales} sales, ${php(p.revenue)})`).join("\n") || "No sales yet" }
+          )
+          .setColor(0x00FF00)
+        ]
+      });
+      return true;
+    }
+
     if (command === "approve") {
       const reference = (args[0] || "").toUpperCase();
       const providerReference = args[1] || `staff-${message.id}`;
@@ -1305,6 +1390,13 @@ export async function handleBridgeInteraction(interaction) {
   if (!id.startsWith("lb_")) return false;
 
   try {
+    // Rate limiting for store/buy actions
+    if (id.startsWith("lb_store") || id.startsWith("lb_category") || id.startsWith("lb_product")) {
+      if (!checkRateLimit(interaction.user.id, "store_browse")) {
+        throw new Error("You're browsing too fast. Please wait a moment.");
+      }
+    }
+
     if (id.startsWith("lb_review_confirm_") || id.startsWith("lb_review_deny_")) {
       if (interaction.user.id !== REVIEWER_ID) {
         throw new Error("This payment decision is assigned to another reviewer.");

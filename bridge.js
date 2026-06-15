@@ -32,6 +32,44 @@ const EXPIRY_NOTIFY_DAYS = Number(process.env.RANK_EXPIRY_REMINDER_DAYS || 7);
 let transactionQueue = Promise.resolve();
 let webServerStarted = false;
 
+// Simple caching for performance
+const cache = {
+  catalog: null,
+  catalogTime: 0,
+  storeSettings: null,
+  storeSettingsTime: 0
+};
+
+const CACHE_TTL = 5000; // 5 seconds
+
+function getCatalogCached() {
+  const now = Date.now();
+  if (cache.catalog && (now - cache.catalogTime) < CACHE_TTL) return cache.catalog;
+  const catalog = loadJson(CATALOG_FILE);
+  cache.catalog = catalog;
+  cache.catalogTime = now;
+  return catalog;
+}
+
+function getStoreSettingsCached() {
+  const now = Date.now();
+  if (cache.storeSettings && (now - cache.storeSettingsTime) < CACHE_TTL) return cache.storeSettings;
+  const settings = getStoreSettings();
+  cache.storeSettings = settings;
+  cache.storeSettingsTime = now;
+  return settings;
+}
+
+function invalidateCatalogCache() {
+  cache.catalog = null;
+  cache.catalogTime = 0;
+}
+
+function invalidateStoreSettingsCache() {
+  cache.storeSettings = null;
+  cache.storeSettingsTime = 0;
+}
+
 function ensureDataFile() {
   if (fs.existsSync(DATA_FILE)) return;
   fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
@@ -724,6 +762,18 @@ async function processDeliveryQueue(client) {
   }
 }
 
+async function logRefund(client, userId, amountCentavos, reason, orderId) {
+  await audit(client, `Refund: <@${userId}> ${php(amountCentavos)} (${reason}) order: \`${orderId}\``);
+}
+
+function validateInputLength(text, max, fieldName) {
+  if (!text || text.length === 0 || text.length > max) throw new Error(`${fieldName} must be 1-${max} characters.`);
+}
+
+function sanitizeInput(text) {
+  return String(text || "").trim().slice(0, 500).replace(/[\n\r]/g, " ");
+}
+
 export async function handleBridgeDmMessage(message) {
   const attachment = message.attachments.find(file =>
     file.contentType?.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(file.name || file.url)
@@ -775,7 +825,7 @@ export async function handleBridgeCommand(message, command, args) {
   if (![
     "bridgepanel", "linkpanel", "paneledit", "testexpire", "wallet", "store", "link",
     "profile", "orders", "payments", "help", "approve", "credit", "order",
-    "addproduct", "removeproduct", "products", "storemode"
+    "addproduct", "removeproduct", "products", "storemode", "editproduct", "refund"
   ].includes(command)) {
     return false;
   }
@@ -825,7 +875,9 @@ export async function handleBridgeCommand(message, command, args) {
         return true;
       }
       const [title, description] = fields;
-      setPanelOverride(panel, title, description);
+      validateInputLength(title, 100, "Title");
+      validateInputLength(description, 500, "Description");
+      setPanelOverride(panel, sanitizeInput(title), sanitizeInput(description));
       await runTransaction(() => {});
       await audit(message.client, `Panel updated: ${panel} by <@${message.author.id}>`);
       await message.reply({ embeds: [animatedEmbed("Panel Updated", `The ${panel} panel content has been updated successfully.`)] });
@@ -988,12 +1040,11 @@ Bedrock names must start with a dot, for example .Steve123.`
         throw new Error("Use `?addproduct (name) (description) (Rank or Keys) (price)`.");
       }
       const [name, description, rawType, rawPrice] = fields;
-      const type = rawType.toLowerCase();
+      validateInputLength(name, 80, "Name");
+      validateInputLength(description, 300, "Description");
+      const type = String(rawType).toLowerCase();
       if (!["rank", "ranks", "key", "keys"].includes(type)) {
         throw new Error("Product type must be `Rank` or `Keys`.");
-      }
-      if (!name || name.length > 80 || !description || description.length > 300) {
-        throw new Error("Name must be 1-80 characters and description 1-300 characters.");
       }
       const id = productId(name);
       if (!id) throw new Error("The product name cannot create a valid product ID.");
@@ -1010,8 +1061,8 @@ Bedrock names must start with a dot, for example .Steve123.`
       catalog.products.push({
         id,
         categoryId,
-        name,
-        description,
+        name: sanitizeInput(name),
+        description: sanitizeInput(description),
         priceCentavos,
         enabled: true,
         deliveries: [{ type: "minecraft_command", command: commandTemplate }]
@@ -1116,6 +1167,25 @@ Bedrock names must start with a dot, for example .Steve123.`
       await message.reply({
         embeds: [purchaseReceipt({ ...order, id: orderId }, product, data.users[order.userId]?.balanceCentavos || 0)]
       });
+      return true;
+    }
+
+    if (command === "refund") {
+      const orderId = args[0] || "";
+      const reason = args.slice(1).join(" ") || "Staff refund";
+      if (!orderId) throw new Error("Use `?refund LBO-ID [reason]`.");
+      await runTransaction(data => {
+        const order = data.orders[orderId];
+        if (!order) throw new Error("Order not found.");
+        if (order.status === "refunded") throw new Error("Order already refunded.");
+        if (order.status !== "completed" && order.status !== "manual_review") throw new Error("Can only refund completed or manual_review orders.");
+        addLedger(data, order.userId, order.amountCentavos, `Refund: ${reason}`, `refund:${orderId}`, message.author.id);
+        order.status = "refunded";
+        order.refundedAt = new Date().toISOString();
+      });
+      await logRefund(message.client, undefined, 0, reason, orderId);
+      await audit(message.client, `Order refunded: \`${orderId}\` reason: ${reason} by <@${message.author.id}>`);
+      await message.reply({ embeds: [embed("Order Refunded", `Order \`${orderId}\` was refunded. Reason: ${reason}`)] });
       return true;
     }
 

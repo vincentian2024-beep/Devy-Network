@@ -80,14 +80,14 @@ Do not create `PORT`; Railway supplies it automatically.
 ### Customer Commands
 
 ```text
-?help               - View all available commands
+?help               - View the current command list and usage tips
 ?wallet             - View your private wallet balance and transactions
 ?store              - Open the private store panel
-?profile            - View your linked Minecraft account and wallet details
-?orders             - Show your recent orders
+?profile            - View your linked Minecraft account and wallet status
+?orders             - Show your recent order history
 ?payments           - Show your recent top-ups and payment history
 ?link Java <IGN>    - Link your Java Edition Minecraft account
-?link Bedrock <IGN> - Link your Bedrock Edition account (name must start with .)
+?link Bedrock <IGN> - Link your Bedrock Edition Minecraft account (name must start with .)
 ```
 
 ### Staff Management Commands
@@ -102,7 +102,7 @@ Do not create `PORT`; Railway supplies it automatically.
                         - Edit the title and description of topup/store/link panels
 ?paneledit reset <panel>
                         - Reset a panel to its default text
-?refresh_panels         - Manually refresh all posted panels (runs automatically)
+?refresh_panels         - Manually refresh all posted panels
 ```
 
 #### Product Management
@@ -116,10 +116,10 @@ Do not create `PORT`; Railway supplies it automatically.
 ?removeproduct <name or ID>                  - Remove a product from the store
 ?editproduct <id> <field> <value>            - Edit product details
                                              - Fields: price, stock, enabled, command
-?storemode <open|maintenance|closed>         - Change store availability
+?storemode <open|maintenance|closed>         - Change store access mode
                                              - open: Store accepting purchases
-                                             - maintenance: Store locked (displays status)
-                                             - closed: Store hidden entirely
+                                             - maintenance: Store locked for updates
+                                             - closed: Store panel hidden entirely
 ```
 
 #### Payment & Wallet Management
@@ -134,10 +134,10 @@ Do not create `PORT`; Railway supplies it automatically.
 #### Monitoring & Support
 
 ```text
-?order <LBO-ID>        - View details of a specific order (reference or ID)
-?stats                 - View analytics dashboard (top products, revenue, user count)
+?order <LBO-ID>        - View details for a specific order
+?stats                 - Show analytics dashboard and store metrics
 ?help                  - Show this help message
-?testexpire            - Test the expiry notification system
+?testexpire            - Run a test of the expiry notification system
 ```
 
 ### Examples

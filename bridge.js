@@ -964,7 +964,8 @@ export async function handleBridgeCommand(message, command, args) {
             "`?bridgepanel store` — Post store panel",
             "`?linkpanel` — Post link account panel",
             "`?paneledit <panel> (title) (description)` — Edit panel text",
-            "`?paneledit reset <panel>` — Reset panel to default"
+            "`?paneledit reset <panel>` — Reset panel to default",
+            "`?refresh_panels` — Refresh all posted panels"
           ].join("\n")
         });
         embedFields.push({

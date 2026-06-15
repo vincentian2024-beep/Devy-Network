@@ -1911,58 +1911,6 @@ async function purchase(interaction, productId, requestedEdition = null, request
     components: [confirmRow]
   });
   return { pending: true };
-
-  let externalDeliveryStarted = false;
-  try {
-    for (const delivery of product.deliveries) {
-      if (delivery.type === "minecraft_command") {
-        externalDeliveryStarted = true;
-        await sendRcon(delivery.command.replaceAll("{minecraft}", order.minecraftName));
-      } else if (delivery.type === "discord_role") {
-        if (!/^\d{17,20}$/.test(delivery.roleId)) throw new Error("Invalid product role ID.");
-        const member = await interaction.guild.members.fetch(interaction.user.id);
-        externalDeliveryStarted = true;
-        await member.roles.add(delivery.roleId, `${BRAND} order ${orderId}`);
-      }
-    }
-    await runTransaction(data => {
-      data.orders[orderId].status = "completed";
-      data.orders[orderId].completedAt = new Date().toISOString();
-    });
-    await interaction.editReply({
-      embeds: [embed(
-        "✅ Purchase delivered",
-        `**${product.name}** was delivered successfully.\n\nOrder: \`${orderId}\``
-      )]
-    });
-    order.status = "completed";
-    await interaction.editReply({
-      embeds: [purchaseReceipt(order, product, order.balanceCentavos)]
-    });
-    await notifyEmbed(interaction.client, interaction.user.id,
-      purchaseReceipt(order, product, order.balanceCentavos));
-    await sendReceiptToReviewer(interaction.client,
-      purchaseReceipt(order, product, order.balanceCentavos), interaction.user.id);
-    await audit(interaction.client,
-      `Order completed: \`${orderId}\`, ${product.name}, user <@${interaction.user.id}>.`);
-  } catch (error) {
-    await runTransaction(data => {
-      const record = data.orders[orderId];
-      record.status = externalDeliveryStarted ? "manual_review" : "refunded";
-      record.error = error.message;
-      if (!externalDeliveryStarted) {
-        addLedger(data, interaction.user.id, product.priceCentavos,
-          `Refund: ${product.name}`, `refund:${orderId}`);
-      }
-    });
-    await interaction.editReply(
-      externalDeliveryStarted
-        ? `⚠️ Delivery could not be confirmed. Order \`${orderId}\` needs staff review; no automatic retry was made.`
-        : `❌ Delivery failed before it started. ${php(product.priceCentavos)} was refunded.`
-    );
-    await audit(interaction.client,
-      `Order ${externalDeliveryStarted ? "needs review" : "refunded"}: \`${orderId}\`. ${error.message}`);
-  }
 }
 
 async function sendRcon(command) {

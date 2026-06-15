@@ -35,14 +35,29 @@ let webServerStarted = false;
 function ensureDataFile() {
   if (fs.existsSync(DATA_FILE)) return;
   fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-  fs.writeFileSync(DATA_FILE, JSON.stringify({
-    users: {},
-    payments: {},
-    orders: {},
-    ledger: [],
-    panelOverrides: {}
-  }, null, 2));
+    fs.writeFileSync(DATA_FILE, JSON.stringify({
+      users: {},
+      payments: {},
+      orders: {},
+      ledger: [],
+      panelOverrides: {},
+      storeSettings: { status: "open" },
+      postedPanels: []
+    }, null, 2));
 }
+
+// Backfill missing keys for existing data
+function migrateData() {
+  const data = loadJson(DATA_FILE);
+  let changed = false;
+  if (!data.panelOverrides) { data.panelOverrides = {}; changed = true; }
+  if (!data.storeSettings) { data.storeSettings = { status: "open" }; changed = true; }
+  if (!data.postedPanels) { data.postedPanels = []; changed = true; }
+  if (!data.pendingPurchases) { data.pendingPurchases = {}; changed = true; }
+  if (!data.deliveryQueue) { data.deliveryQueue = []; changed = true; }
+  if (changed) saveData(data);
+}
+migrateData();
 
 ensureDataFile();
 
@@ -373,6 +388,47 @@ function resetPanelOverride(key) {
   });
 }
 
+function getStoreSettings() {
+  const data = loadJson(DATA_FILE);
+  data.storeSettings ??= { status: "open" };
+  return data.storeSettings;
+}
+
+function getStoreStatus() {
+  return String(getStoreSettings().status || "open").toLowerCase();
+}
+
+async function setStoreStatus(client, status, actorId) {
+  const s = String(status || "").toLowerCase();
+  if (!["open", "maintenance", "closed"].includes(s)) throw new Error("Invalid store status.");
+  await runTransaction(data => {
+    data.storeSettings ??= {};
+    data.storeSettings.status = s;
+  });
+  await audit(client, `Store status changed to ${s} by <@${actorId}>.`).catch(() => {});
+  await refreshPanels(client).catch(() => {});
+  return s;
+}
+
+async function refreshPanels(client) {
+  const data = loadJson(DATA_FILE);
+  const posted = data.postedPanels || [];
+  for (const p of posted) {
+    try {
+      const guild = await client.guilds.fetch(p.guildId).catch(() => null);
+      if (!guild) continue;
+      const channel = await guild.channels.fetch(p.channelId).catch(() => null);
+      if (!channel || typeof channel.send !== "function") continue;
+      const msg = await channel.messages.fetch(p.messageId).catch(() => null);
+      if (!msg) continue;
+      const payload = p.type === "store" ? storePanel() : p.type === "topup" ? topupPanel() : linkPanel();
+      await msg.edit(payload).catch(() => {});
+    } catch (e) {
+      // ignore individual failures
+    }
+  }
+}
+
 function topupPanel() {
   const override = getPanelOverride(
     "topup",
@@ -415,9 +471,17 @@ function storePanel() {
       emoji: category.emoji
     })));
 
+  const status = getStoreStatus();
+  const statusLabel = status === "open" ? "🟢 OPEN" : status === "maintenance" ? "🟠 MAINTENANCE" : "🔴 CLOSED";
+
+  const buttons = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId("lb_stats").setLabel("Statistics").setStyle(ButtonStyle.Secondary).setEmoji("📊"),
+    new ButtonBuilder().setCustomId("lb_refresh_panels").setLabel("Refresh Panels").setStyle(ButtonStyle.Secondary).setEmoji("🔁")
+  );
+
   return {
-    embeds: [animatedEmbed(override.title, override.description)],
-    components: [new ActionRowBuilder().addComponents(menu)]
+    embeds: [animatedEmbed(override.title, override.description).addFields({ name: "Store Status", value: statusLabel, inline: true })],
+    components: [new ActionRowBuilder().addComponents(menu), buttons]
   };
 }
 
@@ -583,6 +647,83 @@ async function sendReceiptToReviewer(client, card, userId) {
   );
 }
 
+async function sendCustomerAndStaffReceipts(client, order, product, deliveryStatus) {
+  const data = loadJson(DATA_FILE);
+  const user = await client.users.fetch(order.userId).catch(() => null);
+  const customerCard = purchaseReceipt(order, product, order.balanceCentavos || 0).addFields({ name: "Delivery Status", value: deliveryStatus, inline: true });
+  if (user) await user.send({ embeds: [customerCard] }).catch(() => {});
+  const staffCard = embed("Staff Receipt", `Order ${order.id} processed`).addFields(
+    { name: "Buyer", value: `<@${order.userId}>`, inline: true },
+    { name: "Product", value: product.name, inline: true },
+    { name: "Minecraft", value: `${order.minecraftEdition || "N/A"} - \`${order.minecraftName || "N/A"}\``, inline: true },
+    { name: "Order ID", value: `\`${order.id}\``, inline: true },
+    { name: "Delivery Result", value: deliveryStatus, inline: true },
+    { name: "Timestamp", value: formatDate(order.createdAt), inline: true }
+  );
+  await sendReceiptToReviewer(client, staffCard, order.userId);
+}
+
+async function isPlayerOnline(minecraftName) {
+  if (!process.env.RCON_PASSWORD) return false;
+  const rcon = await Rcon.connect({
+    host: process.env.RCON_HOST || "127.0.0.1",
+    port: Number(process.env.RCON_PORT || 25575),
+    password: process.env.RCON_PASSWORD
+  });
+  try {
+    const res = await rcon.send("list");
+    return String(res).includes(minecraftName.replace(/^\./, ""));
+  } finally {
+    await rcon.end().catch(() => {});
+  }
+}
+
+async function processDeliveryQueue(client) {
+  const data = loadJson(DATA_FILE);
+  const queue = [...(data.deliveryQueue || [])];
+  for (const orderId of queue) {
+    const order = data.orders?.[orderId];
+    if (!order) {
+      // remove non-existent
+      await runTransaction(d => { d.deliveryQueue = (d.deliveryQueue || []).filter(x => x !== orderId); });
+      continue;
+    }
+    if (order.status !== "queued") {
+      await runTransaction(d => { d.deliveryQueue = (d.deliveryQueue || []).filter(x => x !== orderId); });
+      continue;
+    }
+    const catalog = loadJson(CATALOG_FILE);
+    const product = catalog.products.find(p => p.id === order.productId);
+    if (!product) {
+      await runTransaction(d => { d.deliveryQueue = (d.deliveryQueue || []).filter(x => x !== orderId); d.orders[orderId].status = "failed"; d.orders[orderId].error = "Product missing"; });
+      await audit(client, `Delivery failed (product missing): \`${orderId}\``);
+      continue;
+    }
+    try {
+      const online = await isPlayerOnline(order.minecraftName).catch(() => false);
+      if (!online) continue;
+      // attempt deliveries
+      for (const delivery of product.deliveries) {
+        if (delivery.type === "minecraft_command") {
+          await sendRcon(delivery.command.replaceAll("{minecraft}", order.minecraftName));
+        } else if (delivery.type === "discord_role") {
+          const guild = await client.guilds.fetch(DISCORD_SERVER_ID).catch(() => null);
+          if (guild) {
+            const member = await guild.members.fetch(order.userId).catch(() => null);
+            if (member) await member.roles.add(delivery.roleId, `Queued delivery ${orderId}`);
+          }
+        }
+      }
+      await runTransaction(d => { d.orders[orderId].status = "completed"; d.orders[orderId].completedAt = new Date().toISOString(); d.deliveryQueue = (d.deliveryQueue || []).filter(x => x !== orderId); });
+      await sendCustomerAndStaffReceipts(client, order, product, "delivered");
+      await audit(client, `Queued order delivered: \`${orderId}\``);
+    } catch (e) {
+      await runTransaction(d => { d.orders[orderId].status = "manual_review"; d.orders[orderId].error = e.message; });
+      await audit(client, `Queued delivery failed: \`${orderId}\` ${e.message}`);
+    }
+  }
+}
+
 export async function handleBridgeDmMessage(message) {
   const attachment = message.attachments.find(file =>
     file.contentType?.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(file.name || file.url)
@@ -634,7 +775,7 @@ export async function handleBridgeCommand(message, command, args) {
   if (![
     "bridgepanel", "linkpanel", "paneledit", "testexpire", "wallet", "store", "link",
     "profile", "orders", "payments", "help", "approve", "credit", "order",
-    "addproduct", "removeproduct", "products"
+    "addproduct", "removeproduct", "products", "storemode"
   ].includes(command)) {
     return false;
   }
@@ -646,14 +787,22 @@ export async function handleBridgeCommand(message, command, args) {
       if (!["store", "topup"].includes(type)) {
         throw new Error("Use ?bridgepanel topup or ?bridgepanel store.");
       }
-      await message.channel.send(type === "store" ? storePanel() : topupPanel());
+      const sent = await message.channel.send(type === "store" ? storePanel() : topupPanel());
+      await runTransaction(data => {
+        data.postedPanels ??= [];
+        data.postedPanels.push({ guildId: message.guild.id, channelId: message.channel.id, messageId: sent.id, type });
+      });
       await message.delete().catch(() => {});
       return true;
     }
 
     if (command === "linkpanel") {
       if (!isStaff(message.member)) throw new Error("Only staff can post link panels.");
-      await message.channel.send(linkPanel());
+      const sent = await message.channel.send(linkPanel());
+      await runTransaction(data => {
+        data.postedPanels ??= [];
+        data.postedPanels.push({ guildId: message.guild.id, channelId: message.channel.id, messageId: sent.id, type: "link" });
+      });
       await message.delete().catch(() => {});
       return true;
     }
@@ -671,11 +820,14 @@ export async function handleBridgeCommand(message, command, args) {
           throw new Error("Reset target must be topup, store, or link.");
         }
         resetPanelOverride(target);
+        await audit(message.client, `Panel reset: ${target} by <@${message.author.id}>`);
         await message.reply({ embeds: [animatedEmbed("Panel Reset", `The ${target} panel has returned to its default configuration.`)] });
         return true;
       }
       const [title, description] = fields;
       setPanelOverride(panel, title, description);
+      await runTransaction(() => {});
+      await audit(message.client, `Panel updated: ${panel} by <@${message.author.id}>`);
       await message.reply({ embeds: [animatedEmbed("Panel Updated", `The ${panel} panel content has been updated successfully.`)] });
       return true;
     }
@@ -684,6 +836,17 @@ export async function handleBridgeCommand(message, command, args) {
       if (!isStaff(message.member)) throw new Error("Only staff can run expiration tests.");
       const result = await runExpiryCheck(message.client, true);
       await message.reply({ embeds: [animatedEmbed("Rank Expiry Check", result)] });
+      return true;
+    }
+
+    if (command === "storemode") {
+      if (!isStaff(message.member)) throw new Error("Only staff can change store status.");
+      const mode = (args[0] || "").toLowerCase();
+      if (!["open", "maintenance", "closed"].includes(mode)) {
+        throw new Error("Use ?storemode <open|maintenance|closed>.");
+      }
+      await setStoreStatus(message.client, mode, message.author.id);
+      await message.reply({ embeds: [animatedEmbed("Store Status Updated", `Store status set to **${mode.toUpperCase()}**.`)] });
       return true;
     }
 
@@ -854,6 +1017,7 @@ Bedrock names must start with a dot, for example .Steve123.`
         deliveries: [{ type: "minecraft_command", command: commandTemplate }]
       });
       saveCatalog(catalog);
+      await audit(message.client, `Product added: \`${id}\` ${name} (${php(priceCentavos)}) by <@${message.author.id}>`);
       await message.reply({
         embeds: [embed("Product Added", `**${name}** is now available in **${categoryId === "ranks" ? "Ranks" : "Keys"}**.`)
           .addFields(
@@ -862,6 +1026,35 @@ Bedrock names must start with a dot, for example .Steve123.`
             { name: "Automatic Delivery", value: `\`${commandTemplate}\`` }
           )]
       });
+      return true;
+    }
+
+    if (command === "editproduct") {
+      const fields = parenthesizedArguments(message.content);
+      if (fields.length < 3) throw new Error("Use `?editproduct (product id) (field) (value)`. Fields: price, stock, enabled, command");
+      const [id, field, value] = fields;
+      const catalog = loadJson(CATALOG_FILE);
+      const product = catalog.products.find(p => p.id === id || p.id === productId(id));
+      if (!product) throw new Error("Product not found.");
+      if (field === "price") {
+        product.priceCentavos = parseAmount(value);
+      } else if (field === "stock") {
+        const n = Number(value);
+        if (!Number.isInteger(n) || n < 0) throw new Error("Stock must be a non-negative integer.");
+        product.stock = n;
+      } else if (field === "enabled") {
+        product.enabled = ["1","true","yes","on"].includes(value.toLowerCase());
+      } else if (field === "command") {
+        // replace first minecraft_command template
+        const del = product.deliveries.find(d => d.type === "minecraft_command");
+        if (!del) throw new Error("Product has no minecraft_command delivery to edit.");
+        del.command = value;
+      } else {
+        throw new Error("Unknown field. Allowed: price, stock, enabled, command");
+      }
+      saveCatalog(catalog);
+      await audit(message.client, `Product edited: \`${product.id}\` field ${field} by <@${message.author.id}>`);
+      await message.reply({ embeds: [embed("Product Updated", `Updated **${product.name}** (${product.id}).`)] });
       return true;
     }
 
@@ -876,6 +1069,7 @@ Bedrock names must start with a dot, for example .Steve123.`
       if (index < 0) throw new Error("Product not found.");
       const [removed] = catalog.products.splice(index, 1);
       saveCatalog(catalog);
+      await audit(message.client, `Product removed: \`${removed.id}\` ${removed.name} by <@${message.author.id}>`);
       await message.reply({
         embeds: [embed("Product Removed", `**${removed.name}** was removed from the ${SERVER_NAME} store.`)]
       });
@@ -1101,6 +1295,43 @@ export async function handleBridgeInteraction(interaction) {
       await respond(interaction, storePanel());
       return true;
     }
+    if (id === "lb_refresh_panels") {
+      if (!interaction.member || !isStaff(interaction.member)) throw new Error("Only staff can refresh panels.");
+      await respond(interaction, { embeds: [animatedEmbed("Refreshing Panels", "Updating posted store and top-up panels...")] });
+      await refreshPanels(interaction.client);
+      return true;
+    }
+    if (id === "lb_stats") {
+      if (!interaction.member || !isStaff(interaction.member)) throw new Error("Only staff can view statistics.");
+      const data = loadJson(DATA_FILE);
+      const totalSales = Object.values(data.orders || {}).reduce((s, o) => s + (o.amountCentavos || 0), 0);
+      const totalOrders = Object.values(data.orders || {}).length;
+      const pending = Object.values(data.orders || {}).filter(o => o.status === "pending").length;
+      const succeeded = Object.values(data.orders || {}).filter(o => o.status === "delivered" || o.status === "completed").length;
+      const failed = Object.values(data.orders || {}).filter(o => o.status === "failed").length;
+      const products = loadJson(CATALOG_FILE).products || [];
+      const activeProducts = products.length;
+      const card = animatedEmbed("Store Statistics", "Quick store metrics snapshot")
+        .addFields(
+          { name: "Total Sales", value: php(totalSales), inline: true },
+          { name: "Total Orders", value: `${totalOrders}`, inline: true },
+          { name: "Active Products", value: `${activeProducts}`, inline: true },
+          { name: "Pending Deliveries", value: `${pending}`, inline: true },
+          { name: "Successful Deliveries", value: `${succeeded}`, inline: true },
+          { name: "Failed Deliveries", value: `${failed}`, inline: true }
+        );
+      // Top products
+      const counts = {};
+      for (const o of Object.values(data.orders || {})) counts[o.productId] = (counts[o.productId] || 0) + 1;
+      const catalogProducts = loadJson(CATALOG_FILE).products || [];
+      const top = Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([pid,c]) => {
+        const p = catalogProducts.find(x=>x.id===pid);
+        return `${p ? p.name : pid} (${c})`;
+      }).join("\n") || "None";
+      card.addFields({ name: "Top Products", value: top, inline: false });
+      await respond(interaction, { embeds: [card] });
+      return true;
+    }
     if (id === "lb_open_link_modal") {
       const modal = new ModalBuilder()
         .setCustomId("lb_link_submit")
@@ -1268,6 +1499,114 @@ export async function handleBridgeInteraction(interaction) {
         `Top-up created: \`${reference}\`, ${php(amount)}, user <@${interaction.user.id}>.`);
       return true;
     }
+    if (id.startsWith("lb_cancel_")) {
+      const token = id.slice("lb_cancel_".length);
+      await runTransaction(data => {
+        if (data.pendingPurchases && data.pendingPurchases[token]) delete data.pendingPurchases[token];
+      });
+      await interaction.update({ content: "❌ Purchase cancelled.", embeds: [], components: [] });
+      return true;
+    }
+    if (id.startsWith("lb_confirm_")) {
+      const token = id.slice("lb_confirm_".length);
+      const pending = loadJson(DATA_FILE).pendingPurchases?.[token];
+      if (!pending) throw new Error("Purchase confirmation not found or expired.");
+      if (pending.userId !== interaction.user.id) throw new Error("You did not create this purchase intent.");
+      // Prevent duplicate purchases: check recent orders
+      const dataCheck = loadJson(DATA_FILE);
+      const recentSame = Object.values(dataCheck.orders || {}).filter(o => o.userId === interaction.user.id && o.productId === pending.productId && (o.status === "processing" || o.status === "completed" || o.status === "queued") && (new Date() - new Date(o.createdAt) < 1000 * 60 * 5));
+      if (recentSame.length) {
+        throw new Error("A similar recent order exists; please wait before purchasing again.");
+      }
+
+      // Finalize the purchase (create order and deduct)
+      const product = loadJson(CATALOG_FILE).products.find(p => p.id === pending.productId && p.enabled);
+      if (!product) throw new Error("Product is unavailable.");
+      const orderId = `LBO-${crypto.randomUUID()}`;
+      const order = await runTransaction(data => {
+        const user = getUser(data, interaction.user.id);
+        const needsMinecraft = product.deliveries.some(item => item.type === "minecraft_command");
+        if (needsMinecraft) {
+          user.minecraftEdition = pending.requestedEdition || user.minecraftEdition;
+          user.minecraftName = pending.requestedMinecraftName || user.minecraftName;
+        }
+        if (needsMinecraft && (!user.minecraftName || !user.minecraftEdition)) {
+          throw new Error("Enter your Java or Bedrock IGN before buying.");
+        }
+        const balanceAfter = addLedger(data, interaction.user.id, -product.priceCentavos,
+          `Purchase: ${product.name}`, `order:${orderId}`);
+        const receiptId = receiptNumber("LCR");
+        const orderPayload = {
+          id: orderId,
+          userId: interaction.user.id,
+          productId: product.id,
+          amountCentavos: product.priceCentavos,
+          minecraftName: user.minecraftName,
+          minecraftEdition: user.minecraftEdition,
+          receiptId,
+          status: "processing",
+          createdAt: new Date().toISOString(),
+          expiresAt: isRankProduct(product) ? rankExpiresAt() : null,
+          expiryReminderSent: false,
+          expiryExpiredNotified: false
+        };
+        data.orders[orderId] = orderPayload;
+        // remove pending
+        if (data.pendingPurchases) delete data.pendingPurchases[token];
+        return {
+          ...orderPayload,
+          balanceCentavos: balanceAfter
+        };
+      });
+      await audit(interaction.client, `Order created: \`${order.id}\` ${product.name} by <@${interaction.user.id}> (queued: ${order.status === 'queued'})`);
+
+      // Attempt delivery, queue if player offline
+      let externalDeliveryStarted = false;
+      try {
+        for (const delivery of product.deliveries) {
+          if (delivery.type === "minecraft_command") {
+            externalDeliveryStarted = true;
+            try {
+              const online = await isPlayerOnline(order.minecraftName).catch(() => false);
+              if (!online) {
+                await runTransaction(data => { data.deliveryQueue ??= []; data.deliveryQueue.push(order.id); data.orders[order.id].status = "queued"; data.orders[order.id].queuedAt = new Date().toISOString(); });
+                await interaction.update({ content: `⏳ Player is offline. Order \
+\`${order.id}\` queued and will deliver on next login.`, embeds: [], components: [] });
+                await audit(interaction.client, `Order queued: \`${order.id}\` for ${order.minecraftName}`);
+                await sendCustomerAndStaffReceipts(interaction.client, order, product, "queued");
+                return true;
+              }
+              await sendRcon(delivery.command.replaceAll("{minecraft}", order.minecraftName));
+            } catch (e) {
+              throw e;
+            }
+          } else if (delivery.type === "discord_role") {
+            if (!/^[0-9]{17,20}$/.test(delivery.roleId)) throw new Error("Invalid product role ID.");
+            const member = await interaction.guild.members.fetch(interaction.user.id);
+            externalDeliveryStarted = true;
+            await member.roles.add(delivery.roleId, `${BRAND} order ${order.id}`);
+          }
+        }
+        await runTransaction(data => { data.orders[order.id].status = "completed"; data.orders[order.id].completedAt = new Date().toISOString(); });
+        await interaction.update({ embeds: [purchaseReceipt(order, product, order.balanceCentavos)], components: [] });
+        await sendCustomerAndStaffReceipts(interaction.client, order, product, "delivered");
+        await audit(interaction.client, `Order completed: \`${order.id}\` by <@${interaction.user.id}>.`);
+        return true;
+      } catch (error) {
+        await runTransaction(data => {
+          const record = data.orders[order.id];
+          record.status = externalDeliveryStarted ? "manual_review" : "refunded";
+          record.error = error.message;
+          if (!externalDeliveryStarted) {
+            addLedger(data, interaction.user.id, product.priceCentavos,
+              `Refund: ${product.name}`, `refund:${order.id}`);
+          }
+        });
+        await interaction.update({ content: externalDeliveryStarted ? `⚠️ Delivery could not be confirmed. Order \`${order.id}\` needs staff review.` : `❌ Delivery failed before it started. ${php(product.priceCentavos)} was refunded.`, embeds: [], components: [] });
+        await audit(interaction.client, `Order ${externalDeliveryStarted ? "needs review" : "refunded"}: \`${order.id}\`. ${error.message}`);
+        return true;
+      }
+    }
     if (id === "lb_category") {
       const catalog = loadJson(CATALOG_FILE);
       const categoryId = interaction.values[0];
@@ -1387,41 +1726,29 @@ async function purchase(interaction, productId, requestedEdition = null, request
   const catalog = loadJson(CATALOG_FILE);
   const product = catalog.products.find(item => item.id === productId && item.enabled);
   if (!product) throw new Error("Product is unavailable.");
+  // Confirmation flow: create a pending purchase and return confirmation UI
   await interaction.deferReply({ ephemeral: true });
-  const orderId = `LBO-${crypto.randomUUID()}`;
-  const order = await runTransaction(data => {
-    const user = getUser(data, interaction.user.id);
-    const needsMinecraft = product.deliveries.some(item => item.type === "minecraft_command");
-    if (needsMinecraft) {
-      user.minecraftEdition = requestedEdition || user.minecraftEdition;
-      user.minecraftName = requestedMinecraftName || user.minecraftName;
-    }
-    if (needsMinecraft && (!user.minecraftName || !user.minecraftEdition)) {
-      throw new Error("Enter your Java or Bedrock IGN before buying.");
-    }
-    const balanceAfter = addLedger(data, interaction.user.id, -product.priceCentavos,
-      `Purchase: ${product.name}`, `order:${orderId}`);
-    const receiptId = receiptNumber("LCR");
-    const orderPayload = {
-      id: orderId,
+  const token = crypto.randomBytes(6).toString("hex");
+  await runTransaction(data => {
+    data.pendingPurchases ??= {};
+    data.pendingPurchases[token] = {
       userId: interaction.user.id,
       productId: product.id,
       amountCentavos: product.priceCentavos,
-      minecraftName: user.minecraftName,
-      minecraftEdition: user.minecraftEdition,
-      receiptId,
-      status: "processing",
-      createdAt: new Date().toISOString(),
-      expiresAt: isRankProduct(product) ? rankExpiresAt() : null,
-      expiryReminderSent: false,
-      expiryExpiredNotified: false
-    };
-    data.orders[orderId] = orderPayload;
-    return {
-      ...orderPayload,
-      balanceCentavos: balanceAfter
+      requestedEdition,
+      requestedMinecraftName,
+      createdAt: new Date().toISOString()
     };
   });
+  const confirmRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`lb_confirm_${token}`).setLabel("Confirm Purchase").setStyle(ButtonStyle.Success).setEmoji("✅"),
+    new ButtonBuilder().setCustomId(`lb_cancel_${token}`).setLabel("Cancel").setStyle(ButtonStyle.Danger).setEmoji("✖️")
+  );
+  await interaction.editReply({
+    embeds: [animatedEmbed("Confirm Purchase", `${product.name} — ${php(product.priceCentavos)}\n\nClick Confirm to complete the purchase or Cancel to abort.`)],
+    components: [confirmRow]
+  });
+  return { pending: true };
 
   let externalDeliveryStarted = false;
   try {
@@ -1638,4 +1965,8 @@ export function startBridgeService(client) {
   }).listen(port, "0.0.0.0", () => {
     console.log(`${BRAND} service listening on port ${port}`);
   });
+  // Start delivery queue processor every 60 seconds
+  setInterval(() => {
+    processDeliveryQueue(client).catch(err => console.error("Delivery queue error:", err));
+  }, 60 * 1000);
 }

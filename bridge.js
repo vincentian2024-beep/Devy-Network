@@ -24,6 +24,11 @@ const SERVER_NAME = "Lunaris Craft";
 const FOOTER = "Powered by Devy Network";
 const REVIEWER_ID = process.env.PAYMENT_REVIEWER_ID || "806032916353515560";
 const RECEIPT_USER_ID = process.env.PURCHASE_RECEIPT_USER_ID || REVIEWER_ID;
+const TRANSCRIPT_USER_ID = process.env.TRANSCRIPT_USER_ID || RECEIPT_USER_ID;
+const DISCORD_SERVER_ID = process.env.BRIDGE_DISCORD_SERVER_ID || "1514580987936510043";
+const AUDIT_CHANNEL_ID = process.env.BRIDGE_AUDIT_CHANNEL_ID || "1515246807477649468";
+const EXPIRE_DAYS = Number(process.env.RANK_EXPIRE_DAYS || 30);
+const EXPIRY_NOTIFY_DAYS = Number(process.env.RANK_EXPIRY_REMINDER_DAYS || 7);
 let transactionQueue = Promise.resolve();
 let webServerStarted = false;
 
@@ -34,7 +39,8 @@ function ensureDataFile() {
     users: {},
     payments: {},
     orders: {},
-    ledger: []
+    ledger: [],
+    panelOverrides: {}
   }, null, 2));
 }
 
@@ -215,6 +221,41 @@ function embed(title, description) {
     .setTimestamp();
 }
 
+function animatedEmbed(title, description) {
+  return embed(title, description)
+    .setFooter({ text: `${FOOTER} • Live store experience` })
+    .addFields({ name: "Status", value: "⚡ Live bot storefront", inline: true });
+}
+
+function profileEmbed(user, discordUser) {
+  return animatedEmbed("Player Profile & Wallet", `Your ${SERVER_NAME} delivery profile and Discord status.`)
+    .setThumbnail(discordUser.displayAvatarURL({ forceStatic: false, size: 128 }))
+    .addFields(
+      { name: "Discord", value: `${discordUser.tag}\n\`${discordUser.id}\``, inline: true },
+      { name: "Wallet", value: php(user.balanceCentavos || 0), inline: true },
+      { name: "Minecraft Edition", value: user.minecraftEdition || "Not linked", inline: true },
+      { name: "Minecraft IGN", value: user.minecraftName ? `\`${user.minecraftName}\`` : "Not linked", inline: true },
+      { name: "Bridge Server", value: `<#${DISCORD_SERVER_ID}>`, inline: true },
+      { name: "Profile Tip", value: "Use ?link or the Link Account button to register your Java or Bedrock IGN before purchase." }
+    );
+}
+
+function likelyGcashScreenshot(messageText, attachmentName) {
+  const payload = `${messageText || ""} ${attachmentName || ""}`.toLowerCase();
+  return /gcash|receipt|transaction|payment|sender|amount|reference|balance/.test(payload);
+}
+
+async function sendTranscript(client, userId, title, description, fields = []) {
+  const transcriptUser = await client.users.fetch(TRANSCRIPT_USER_ID).catch(() => null);
+  if (!transcriptUser) return;
+  const card = animatedEmbed(title, description)
+    .addFields(
+      { name: "Customer", value: `<@${userId}>\n\`${userId}\``, inline: true },
+      ...fields
+    );
+  await transcriptUser.send({ embeds: [card] }).catch(() => {});
+}
+
 function gcashStyleReceipt(payment, reference, title = "GCash Payment Receipt") {
   const statusLabel = {
     pending: "Pending screenshot",
@@ -238,7 +279,7 @@ function gcashStyleReceipt(payment, reference, title = "GCash Payment Receipt") 
 }
 
 function purchaseReceipt(order, product, balanceCentavos) {
-  return embed("Lunaris Purchase Receipt", "Official automated Minecraft delivery receipt.")
+  const receipt = embed("Lunaris Purchase Receipt", "Official automated Minecraft delivery receipt.")
     .addFields(
       { name: "Order ID", value: `\`${order.id}\``, inline: true },
       { name: "Receipt ID", value: `\`${order.receiptId}\``, inline: true },
@@ -251,9 +292,16 @@ function purchaseReceipt(order, product, balanceCentavos) {
         name: "Minecraft",
         value: `${order.minecraftEdition || "N/A"} - \`${order.minecraftName || "N/A"}\``,
         inline: true
-      },
-      { name: "Date", value: formatDate(order.createdAt), inline: true }
+      }
     );
+  if (order.expiresAt) {
+    receipt.addFields({
+      name: "Expiry",
+      value: `${expiryStatus(order)}\n${formatDate(order.expiresAt)}`,
+      inline: true
+    });
+  }
+  return receipt.addFields({ name: "Date", value: formatDate(order.createdAt), inline: true });
 }
 
 function walletComponents() {
@@ -272,7 +320,12 @@ function walletComponents() {
       .setCustomId("lb_store")
       .setLabel("Open store")
       .setEmoji("🛒")
-      .setStyle(ButtonStyle.Primary)
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId("lb_open_link_modal")
+      .setLabel("Link account")
+      .setEmoji("🔗")
+      .setStyle(ButtonStyle.Secondary)
   )];
 }
 
@@ -295,28 +348,63 @@ function legacyTopupPanel() {
   };
 }
 
+function getPanelOverride(key, defaultTitle, defaultDescription) {
+  const data = loadJson(DATA_FILE);
+  const override = data.panelOverrides?.[key];
+  return override ? {
+    title: override.title,
+    description: override.description
+  } : {
+    title: defaultTitle,
+    description: defaultDescription
+  };
+}
+
+function setPanelOverride(key, title, description) {
+  return runTransaction(data => {
+    data.panelOverrides ??= {};
+    data.panelOverrides[key] = { title, description };
+  });
+}
+
+function resetPanelOverride(key) {
+  return runTransaction(data => {
+    if (data.panelOverrides) delete data.panelOverrides[key];
+  });
+}
+
 function topupPanel() {
+  const override = getPanelOverride(
+    "topup",
+    "Secure Wallet Top-up",
+    [
+      `Add credit to your **${SERVER_NAME}** wallet and use it in the official store.`,
+      "",
+      "- Enter your amount and sending GCash number.",
+      "- Send the exact amount using the displayed instructions.",
+      "- DM the screenshot receipt to this bot after sending payment.",
+      "- The payment reviewer receives the request and screenshot automatically.",
+      "- You receive a receipt DM as soon as it is confirmed or denied.",
+      "",
+      "Your Minecraft account must be linked first. Click Link Account before topping up."
+    ].join("\n")
+  );
   return {
-    embeds: [embed(
-      "Secure Wallet Top-up",
-      [
-        `Add credit to your **${SERVER_NAME}** wallet and use it in the official store.`,
-        "",
-        "- Enter your amount and sending GCash number.",
-        "- Send the exact amount using the displayed instructions.",
-        "- DM the screenshot receipt to this bot after sending payment.",
-        "- The payment reviewer receives the request and screenshot automatically.",
-        "- You receive a receipt DM as soon as it is confirmed or denied.",
-        "",
-        "Use the exact amount and keep the receipt visible in the screenshot."
-      ].join("\n")
-    )],
+    embeds: [animatedEmbed(override.title, override.description)],
     components: walletComponents()
   };
 }
 
 function storePanel() {
   const catalog = loadJson(CATALOG_FILE);
+  const override = getPanelOverride(
+    "store",
+    `🌙 ${SERVER_NAME} Store`,
+    `Welcome to the official **${SERVER_NAME}** store.\n\n` +
+    "Select a category below to browse ranks and keys. Purchases use your secure Lunaris wallet and are delivered automatically.\n\n" +
+    `**Server Address**\n\`${process.env.MINECRAFT_SERVER_ADDRESS || "Coming soon"}\`\n` +
+    "Your account must be linked before buying. Click Link Account or use ?link."
+  );
   const menu = new StringSelectMenuBuilder()
     .setCustomId("lb_category")
     .setPlaceholder("Pick a category...")
@@ -328,34 +416,54 @@ function storePanel() {
     })));
 
   return {
-    embeds: [embed(
-      `🌙 ${SERVER_NAME} Store`,
-      `Welcome to the official **${SERVER_NAME}** store.\n\n` +
-      "Select a category below to browse ranks and keys. Purchases use your secure Lunaris wallet and are delivered automatically.\n\n" +
-      `**Server Address**\n\`${process.env.MINECRAFT_SERVER_ADDRESS || "Coming soon"}\``
-    )],
+    embeds: [animatedEmbed(override.title, override.description)],
     components: [new ActionRowBuilder().addComponents(menu)]
   };
 }
 
-function walletView(userId) {
+function linkPanel() {
+  const override = getPanelOverride(
+    "link",
+    "Link Your Minecraft Account",
+    [
+      `Link your Java or Bedrock delivery account before topping up or buying items.`,
+      "",
+      "- Java IGN: `Steve123`",
+      "- Bedrock IGN: `.Steve123` (must start with a dot)",
+      "- Use the button below or `?link` command to connect your account.",
+      "",
+      "This step is required before you can top up or complete purchases."
+    ].join("\n")
+  );
+
+  return {
+    embeds: [animatedEmbed(override.title, override.description)],
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("lb_open_link_modal")
+        .setLabel("Link Account")
+        .setEmoji("🔗")
+        .setStyle(ButtonStyle.Primary)
+    )]
+  };
+}
+
+function walletView(userId, discordUser = null) {
   const data = loadJson(DATA_FILE);
-  const user = data.users[userId] || { balanceCentavos: 0, minecraftName: null };
+  const user = data.users[userId] || { balanceCentavos: 0, minecraftName: null, minecraftEdition: null };
   const recent = data.ledger
     .filter(entry => entry.userId === userId)
     .slice(-5)
     .reverse();
-  const card = embed(
+  const card = animatedEmbed(
     "💳 Lunaris Wallet",
-    `Your secure ${SERVER_NAME} account balance and delivery profile.`
+    `Your secure ${SERVER_NAME} wallet and delivery profile.`
   ).addFields(
     { name: "Available Balance", value: `**${php(user.balanceCentavos)}**`, inline: true },
-    {
-      name: "Minecraft Account",
-      value: user.minecraftName ? `\`${user.minecraftName}\`` : "Not linked",
-      inline: true
-    },
-    { name: "Account Status", value: "Active", inline: true }
+    { name: "Minecraft Edition", value: user.minecraftEdition || "Not linked", inline: true },
+    { name: "Minecraft IGN", value: user.minecraftName ? `\`${user.minecraftName}\`` : "Not linked", inline: true },
+    { name: "Account Status", value: "Active", inline: true },
+    { name: "Tip", value: "Link your Minecraft account before topping up or buying items. Use ?link or the Link Account button." }
   );
   if (recent.length) {
     card.addFields({
@@ -465,9 +573,14 @@ async function sendPaymentReview(client, reference, payment) {
   });
 }
 
-async function sendReceiptToReviewer(client, card) {
+async function sendReceiptToReviewer(client, card, userId) {
   const reviewer = await client.users.fetch(RECEIPT_USER_ID).catch(() => null);
   if (reviewer) await reviewer.send({ embeds: [card] }).catch(() => {});
+  await sendTranscript(client, userId,
+    "Receipt sent to owner",
+    `A purchase receipt for <@${userId}> was delivered to the owner.`,
+    [{ name: "Receipt Owner", value: `<@${RECEIPT_USER_ID}>`, inline: true }]
+  );
 }
 
 export async function handleBridgeDmMessage(message) {
@@ -499,14 +612,19 @@ export async function handleBridgeDmMessage(message) {
   });
 
   await sendPaymentReview(message.client, result.reference, result.payment);
-  const receipt = gcashStyleReceipt(result.payment, result.reference, "GCash Receipt Submitted");
-  if (result.payment.proofUrl) receipt.setImage(result.payment.proofUrl);
-  await message.reply({
-    embeds: [receipt.addFields({
+  const receipt = gcashStyleReceipt(result.payment, result.reference, "GCash Receipt Submitted")
+    .addFields({
       name: "Next Step",
       value: `Your proof was sent to <@${REVIEWER_ID}>. You will receive a receipt update when it is approved or denied.`
-    })]
-  });
+    });
+  await message.reply({ embeds: [receipt] });
+  await sendTranscript(message.client, message.author.id,
+    "GCash screenshot received",
+    `The customer submitted a payment screenshot for reference ${result.reference}.`,
+    [
+      { name: "Attachment", value: attachment.url || attachment.name || "Unknown" }
+    ]
+  );
   await audit(message.client,
     `Payment proof submitted: \`${result.reference}\`, user <@${message.author.id}>.`);
   return true;
@@ -514,8 +632,9 @@ export async function handleBridgeDmMessage(message) {
 
 export async function handleBridgeCommand(message, command, args) {
   if (![
-    "bridgepanel", "wallet", "store", "link", "profile", "orders", "payments",
-    "approve", "credit", "order", "addproduct", "removeproduct", "products"
+    "bridgepanel", "linkpanel", "paneledit", "testexpire", "wallet", "store", "link",
+    "profile", "orders", "payments", "help", "approve", "credit", "order",
+    "addproduct", "removeproduct", "products"
   ].includes(command)) {
     return false;
   }
@@ -524,8 +643,93 @@ export async function handleBridgeCommand(message, command, args) {
     if (command === "bridgepanel") {
       if (!isStaff(message.member)) throw new Error("Only staff can post bridge panels.");
       const type = (args[0] || "topup").toLowerCase();
+      if (!["store", "topup"].includes(type)) {
+        throw new Error("Use ?bridgepanel topup or ?bridgepanel store.");
+      }
       await message.channel.send(type === "store" ? storePanel() : topupPanel());
       await message.delete().catch(() => {});
+      return true;
+    }
+
+    if (command === "linkpanel") {
+      if (!isStaff(message.member)) throw new Error("Only staff can post link panels.");
+      await message.channel.send(linkPanel());
+      await message.delete().catch(() => {});
+      return true;
+    }
+
+    if (command === "paneledit") {
+      if (!isStaff(message.member)) throw new Error("Only staff can edit panels.");
+      const fields = parenthesizedArguments(message.content);
+      const panel = (args[0] || "").toLowerCase();
+      if (!["topup", "store", "link", "reset"].includes(panel) || (panel !== "reset" && fields.length !== 2)) {
+        throw new Error("Use ?paneledit <topup|store|link> (title) (description) or ?paneledit reset <topup|store|link>.");
+      }
+      if (panel === "reset") {
+        const target = (args[1] || "").toLowerCase();
+        if (!["topup", "store", "link"].includes(target)) {
+          throw new Error("Reset target must be topup, store, or link.");
+        }
+        resetPanelOverride(target);
+        await message.reply({ embeds: [animatedEmbed("Panel Reset", `The ${target} panel has returned to its default configuration.`)] });
+        return true;
+      }
+      const [title, description] = fields;
+      setPanelOverride(panel, title, description);
+      await message.reply({ embeds: [animatedEmbed("Panel Updated", `The ${panel} panel content has been updated successfully.`)] });
+      return true;
+    }
+
+    if (command === "testexpire") {
+      if (!isStaff(message.member)) throw new Error("Only staff can run expiration tests.");
+      const result = await runExpiryCheck(message.client, true);
+      await message.reply({ embeds: [animatedEmbed("Rank Expiry Check", result)] });
+      return true;
+    }
+
+    if (command === "help") {
+      const staff = isStaff(message.member);
+      const embedFields = [
+        {
+          name: "Customer Commands",
+          value: [
+            "`?wallet` — View your private wallet",
+            "`?store` — Open the private store",
+            "`?profile` — View your linked Minecraft info and wallet",
+            "`?link <Java|Bedrock> <IGN>` — Link your Minecraft account",
+            "`?orders` — Show recent orders",
+            "`?payments` — Show recent top-ups"
+          ].join("\n")
+        }
+      ];
+      if (staff) {
+        embedFields.push({
+          name: "Staff Panels",
+          value: [
+            "`?bridgepanel topup` — Post top-up panel",
+            "`?bridgepanel store` — Post store panel",
+            "`?linkpanel` — Post link account panel",
+            "`?paneledit <panel> (title) (description)` — Edit panel text",
+            "`?paneledit reset <panel>` — Reset panel to default"
+          ].join("\n")
+        });
+        embedFields.push({
+          name: "Management",
+          value: [
+            "`?addproduct (name) (description) (Rank or Keys) (price)`",
+            "`?removeproduct (name or ID)`",
+            "`?products` — List configured products",
+            "`?approve LB-REFERENCE RECEIPT-ID` — Approve top-up",
+            "`?credit @member 500 reason` — Manually credit wallet",
+            "`?order LBO-ID` — Show order details",
+            "`?testexpire` — Run expiry notification test"
+          ].join("\n")
+        });
+      }
+      await sendPrivateCommandResult(message, {
+        embeds: [animatedEmbed("Command Center", "Official wallet, store, and delivery command list.")
+          .addFields(embedFields)]
+      });
       return true;
     }
 
@@ -540,17 +744,31 @@ export async function handleBridgeCommand(message, command, args) {
     }
 
     if (command === "link") {
-      const edition = args.length > 1 ? normalizeEdition(args[0]) : "java";
-      const username = normalizeMinecraftName(edition, args.length > 1 ? args[1] : args[0]);
+      if (!args.length) throw new Error("Use ?link <Java|Bedrock> <IGN> or ?link .BedrockName.");
+      let edition;
+      let usernameArg;
+      if (args.length === 1 && args[0].startsWith(".")) {
+        edition = "bedrock";
+        usernameArg = args[0];
+      } else if (args.length === 1) {
+        edition = "java";
+        usernameArg = args[0];
+      } else {
+        edition = normalizeEdition(args[0]);
+        usernameArg = args[1];
+      }
+      const username = normalizeMinecraftName(edition, usernameArg);
       await runTransaction(data => {
         const user = getUser(data, message.author.id);
         user.minecraftName = username;
         user.minecraftEdition = edition;
       });
       await sendPrivateCommandResult(message, {
-        embeds: [embed(
+        embeds: [animatedEmbed(
           "Minecraft Account Linked",
-          `Your ${edition} delivery account is now linked to \`${username}\`.\n\nBedrock names must start with a dot, for example \`.Steve123\`.`
+          `Your ${edition} delivery account is now linked to \`${username}\`.
+
+Bedrock names must start with a dot, for example .Steve123.`
         )]
       });
       return true;
@@ -560,13 +778,7 @@ export async function handleBridgeCommand(message, command, args) {
       const data = loadJson(DATA_FILE);
       const user = data.users[message.author.id] || { balanceCentavos: 0, minecraftName: null, minecraftEdition: null };
       await sendPrivateCommandResult(message, {
-        embeds: [embed("Delivery Profile", "Your wallet and Minecraft delivery settings.")
-          .addFields(
-            { name: "Wallet", value: php(user.balanceCentavos || 0), inline: true },
-            { name: "Edition", value: user.minecraftEdition || "Not set", inline: true },
-            { name: "IGN", value: user.minecraftName ? `\`${user.minecraftName}\`` : "Not set", inline: true },
-            { name: "Bedrock Rule", value: "Bedrock names must begin with a dot, such as `.Steve123`." }
-          )]
+        embeds: [profileEmbed(user, message.author)]
       });
       return true;
     }
@@ -889,7 +1101,64 @@ export async function handleBridgeInteraction(interaction) {
       await respond(interaction, storePanel());
       return true;
     }
+    if (id === "lb_open_link_modal") {
+      const modal = new ModalBuilder()
+        .setCustomId("lb_link_submit")
+        .setTitle("Link Minecraft Account")
+        .addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId("edition")
+              .setLabel("Java or Bedrock")
+              .setStyle(TextInputStyle.Short)
+              .setPlaceholder("Java or Bedrock")
+              .setRequired(true)
+          ),
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId("ign")
+              .setLabel("Minecraft IGN")
+              .setStyle(TextInputStyle.Short)
+              .setPlaceholder("Java: Steve123 | Bedrock: .Steve123")
+              .setRequired(true)
+          )
+        );
+      await interaction.showModal(modal);
+      return true;
+    }
+    if (id === "lb_link_submit") {
+      const edition = normalizeEdition(interaction.fields.getTextInputValue("edition"));
+      const ign = normalizeMinecraftName(edition, interaction.fields.getTextInputValue("ign"));
+      await runTransaction(data => {
+        const user = getUser(data, interaction.user.id);
+        user.minecraftEdition = edition;
+        user.minecraftName = ign;
+      });
+      await interaction.reply({
+        embeds: [animatedEmbed("Minecraft Linked", `Your ${edition} account is now linked as \`${ign}\`.`)] ,
+        ephemeral: true
+      });
+      return true;
+    }
     if (id === "lb_topup") {
+      const data = loadJson(DATA_FILE);
+      const user = data.users[interaction.user.id] || {};
+      if (!user.minecraftName || !user.minecraftEdition) {
+        await respond(interaction, {
+          embeds: [animatedEmbed(
+            "Link Required",
+            "Please link your Java or Bedrock account before topping up. Use the Link Account button below or ?link command."
+          )],
+          components: [new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+              .setCustomId("lb_open_link_modal")
+              .setLabel("Link account now")
+              .setEmoji("🔗")
+              .setStyle(ButtonStyle.Primary)
+          )]
+        });
+        return true;
+      }
       const modal = new ModalBuilder()
         .setCustomId("lb_topup_submit")
         .setTitle("Top up your account")
@@ -950,20 +1219,29 @@ export async function handleBridgeInteraction(interaction) {
           .setEmoji("✖️")
           .setStyle(ButtonStyle.Danger)
       );
+          const screenshotNote = likelyGcashScreenshot(interaction.fields.getTextInputValue("phone"), reference)
+        ? "Screenshot looks like a GCash confirmation request."
+        : "Please verify the screenshot carefully; it may not be a GCash receipt.";
       await reviewer.send({
-        embeds: [embed("Payment Review Required", "A customer submitted a new Lunaris Craft top-up request.")
+        embeds: [animatedEmbed("Payment Review Required", "A customer submitted a new Lunaris Craft top-up request.")
           .addFields(
             { name: "Customer", value: `<@${interaction.user.id}>\n\`${interaction.user.id}\``, inline: true },
             { name: "Amount", value: `**${php(amount)}**`, inline: true },
             { name: "Sender Number", value: `\`${phone}\``, inline: true },
             { name: "Reference", value: `\`${reference}\`` },
-            {
-              name: "Review",
-              value: "Verify that the exact payment arrived, then select Confirm or Deny below."
-            }
+            { name: "Review", value: "Verify that the exact payment arrived, then select Confirm or Deny below." },
+            { name: "Receipt Check", value: screenshotNote }
           )],
         components: [reviewRow]
       });
+      await sendTranscript(interaction.client, interaction.user.id,
+        "Top-up request created",
+        `A customer created a top-up request with reference ${reference}.`,
+        [
+          { name: "Amount", value: php(amount), inline: true },
+          { name: "Phone", value: `\`${phone}\``, inline: true }
+        ]
+      );
 
       await interaction.reply({
         embeds: [embed(
@@ -1124,7 +1402,7 @@ async function purchase(interaction, productId, requestedEdition = null, request
     const balanceAfter = addLedger(data, interaction.user.id, -product.priceCentavos,
       `Purchase: ${product.name}`, `order:${orderId}`);
     const receiptId = receiptNumber("LCR");
-    data.orders[orderId] = {
+    const orderPayload = {
       id: orderId,
       userId: interaction.user.id,
       productId: product.id,
@@ -1133,10 +1411,14 @@ async function purchase(interaction, productId, requestedEdition = null, request
       minecraftEdition: user.minecraftEdition,
       receiptId,
       status: "processing",
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      expiresAt: isRankProduct(product) ? rankExpiresAt() : null,
+      expiryReminderSent: false,
+      expiryExpiredNotified: false
     };
+    data.orders[orderId] = orderPayload;
     return {
-      ...data.orders[orderId],
+      ...orderPayload,
       balanceCentavos: balanceAfter
     };
   });
@@ -1171,7 +1453,7 @@ async function purchase(interaction, productId, requestedEdition = null, request
     await notifyEmbed(interaction.client, interaction.user.id,
       purchaseReceipt(order, product, order.balanceCentavos));
     await sendReceiptToReviewer(interaction.client,
-      purchaseReceipt(order, product, order.balanceCentavos));
+      purchaseReceipt(order, product, order.balanceCentavos), interaction.user.id);
     await audit(interaction.client,
       `Order completed: \`${orderId}\`, ${product.name}, user <@${interaction.user.id}>.`);
   } catch (error) {
@@ -1227,6 +1509,50 @@ async function approvePayment(reference, providerReference, actorId) {
       payment: { ...payment }
     };
   });
+}
+
+async function runExpiryCheck(client, test = false) {
+  const data = loadJson(DATA_FILE);
+  const catalog = loadJson(CATALOG_FILE);
+  const messages = [];
+  const now = Date.now();
+  for (const order of Object.values(data.orders || {})) {
+    if (order.status !== "completed" || !order.expiresAt) continue;
+    const expiresAt = new Date(order.expiresAt).getTime();
+    const daysLeft = Math.ceil((expiresAt - now) / (1000 * 60 * 60 * 24));
+    const product = catalog.products.find(item => item.id === order.productId);
+    const productName = product?.name || order.productId;
+    if (daysLeft <= 0 && !order.expiryExpiredNotified) {
+      const user = await client.users.fetch(order.userId).catch(() => null);
+      if (user) {
+        await user.send({ embeds: [animatedEmbed(
+          "Rank Expired",
+          `Your ${productName} has expired. Please renew within ${EXPIRE_DAYS} days to keep your benefits.`
+        ).addFields(
+          { name: "Expired On", value: formatDate(order.expiresAt), inline: true },
+          { name: "Order", value: `\`${order.id}\``, inline: true }
+        )] }).catch(() => {});
+      }
+      order.expiryExpiredNotified = true;
+      messages.push(`Expired: ${order.id}`);
+    } else if (daysLeft <= EXPIRY_NOTIFY_DAYS && !order.expiryReminderSent) {
+      const user = await client.users.fetch(order.userId).catch(() => null);
+      if (user) {
+        await user.send({ embeds: [animatedEmbed(
+          "Rank Renewal Reminder",
+          `Your ${productName} will expire in ${daysLeft} day${daysLeft === 1 ? "" : "s"}. Renew it before expiration to keep your benefits.`
+        ).addFields(
+          { name: "Expires On", value: formatDate(order.expiresAt), inline: true },
+          { name: "Order", value: `\`${order.id}\``, inline: true }
+        )] }).catch(() => {});
+      }
+      order.expiryReminderSent = true;
+      messages.push(`Reminder: ${order.id} (${daysLeft} days)`);
+    }
+  }
+  if (!test) saveData(data);
+  if (!messages.length) return test ? "No rank expiry notifications would send." : "No rank expiry notifications found.";
+  return messages.join("\n");
 }
 
 async function notify(client, userId, message) {
